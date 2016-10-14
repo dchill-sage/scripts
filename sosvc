@@ -1,0 +1,237 @@
+#!/bin/sh
+# sosvc script by Darren Hill <dchill-sage>
+#
+# Starts/stops SageOne services
+#
+# Accepts path via SOSVC_PATH environment variable or command line argument.
+# With no path specified, guesses base directory from current directory.
+#
+# Runs mysageone_ variants on port 3000 (3001 for _ca)
+# Runs sageone_basics variants on port 3040 (3041 for _ca)
+# Runs sage_one_advanced on port 3032
+# Runs all other host apps on port 3030 (3031 for _ca)
+
+# Set vars
+path=""
+cmd="rails s"
+kcmd="rails s -d -p "
+pidnm="server"
+port=0
+envt=""
+all=0
+
+# Output bold colored text
+function cecho {
+    echo "\033[1;35m$1\033[0m"
+}
+
+# Output error and exit
+function show_error {
+    echo "\033[31m$1\033[0m"
+    exit 1
+}
+
+# Show done
+function show_done {
+    echo "\033[1;32m[Done]\033[0m"
+}
+
+# Identify singular path
+function find_one_path {
+    [ -n "$path" ] || path=$PWD
+    path=$(find $path -name "host_app" -type d -print -quit 2>/dev/null)
+    if [ -d "$path" ]; then
+        # Found app dir
+        path=$(dirname $path)
+        return 0
+    else
+        path=$PWD
+        while [ "$path" != "/" ]; do
+            path=$(dirname $path)
+            [ -d ${path}/host_app ] && break
+        done
+        [ "$path" == "/" ] && show_error "Failed to find local host_app directory"
+        cecho "Found app path $path"
+        return 0
+    fi
+}
+
+# Identify all immediate host_app paths
+function find_all_paths {
+    if [ -n "$path" ]; then
+        # Cleanup path parameter
+        [[ "$path" == /* ]] || path="$PWD/${path#./}"
+        cecho "Using path $path"
+        path="${path%/}/*"
+        return 0
+    fi
+
+    if [ -n "$SOSVC_PATH" ]; then
+        # Use environment variable
+        if [ -d "$SOSVC_PATH" ]; then
+            cecho "Using environment path $SOSVC_PATH"
+            path="${SOSVC_PATH%/}/*"
+            return 0
+        else
+            show_error "$SOSVC_PATH is not a directory - please check SOSVC_PATH"
+        fi
+    fi
+
+    path=$(find $PWD -name "mysageone_*" -type d -print -quit 2>/dev/null)
+    if [ -d "$path" ]; then
+        # Found base dir
+        path=$(dirname $path)
+    elif [[ "$PWD" == */mysageone_* ]]; then
+        # Base is in path
+        path=${PWD%/mysageone_*}
+    else
+        # Search path for base dir
+        path=$PWD
+        while [ "$path" != "/" ]; do
+            path=$(dirname $path)
+            [ -d $path/mysageone_* ] && break
+        done
+        if [ "$path" == "/" ]; then
+            # Failed
+            show_error "Service path not found, please set SOSVC_PATH or specify in arguments"
+        fi
+    fi
+
+    [[ "$path" == /* ]] || path="$PWD/${path#./}"
+    cecho "Found path $path"
+    path="${path%/}/*"
+}
+
+# Get path from param, env, or search
+function find_path {
+    if [ $all -ne 0 ]; then find_all_paths; else find_one_path; fi
+}
+
+# Get port number from path
+function find_port {
+    name=$(basename ${1%/host_app*})
+    case ${name%_??} in
+        mysageone) port=3000;;
+        sageone_basics) port=3040;;
+        sage_one_advanced) port=3032;;
+        sage_one_addons) port=3050;;
+        sage_one_payroll) port=3051;;
+        business_monitor_client) port=4040;;
+        business_monitor_accountant) port=4050;;
+        *) port=3030;;
+    esac
+    #[ "${name##*_}" == "ca" ] && port=$((port+1))
+}
+
+# Check environment and start host apps
+function start_svc {
+    [ -z "$envt" ] || envt=" -e $envt"
+    for dir in ${path}/host_app; do
+        cd $dir
+        find_port $dir
+        cecho "* Starting service in $dir on $port"
+        bundle check || bundle install
+        bundle exec ${cmd} -d -p ${port}${envt}
+        echo
+    done
+    show_done
+}
+
+# Kill pid in server pidfile
+function kill_file {
+    kill $(<"$1")
+    rm "$1"
+}
+
+# Kill service by port num
+function kill_port {
+    find_port $1
+    ps ax > ps.tmp
+    kill $(awk "/$kcmd$port/{print \$1}" ps.tmp)
+    rm ps.tmp
+}
+
+# Kill running servers in path by pid
+function stop_svc {
+    for file in ${path}/host_app/tmp/pids/${pidnm}.pid; do
+        cecho "* Stopping service in ${file%/host_app*}"
+        if [ -e $file ]; then
+            kill_file $file
+        else
+            kill_port $file
+        fi
+    done
+    show_done
+}
+
+function usage {
+    cat <<FIN
+Usage: $0 [options] start|stop|restart [path]
+    -h      Display this help text
+    -a      Manipulate all immediate services
+    -t      Threaded server
+    -p      Production environment
+    -e      Environment
+            Default: development
+
+Description:
+    Starts and stops the parallel rails servers for SageOne.
+    Accepts SOSVC_PATH environment variable for path.
+    Without a specified path, searches the current directory
+    and its parents for SageOne repos, and selects the first
+    one found.
+FIN
+    exit 1
+}
+
+# Handle options
+while getopts ":hatpe:" opt; do
+    case $opt in
+        h)
+            usage
+            ;;
+        a)
+            all=1;
+            shift
+            ;;
+        t)
+            cmd="thin start --threaded"
+			kcmd="thin server .*:"
+			pidnm="thin"
+            shift
+            ;;
+        p)
+            envt="production"
+            shift
+            ;;
+        e)
+            envt=$OPTARG
+            shift 2
+            ;;
+        \?)
+            usage
+            ;;
+    esac
+done
+(( $# >= 1 && $# <= 2 )) || usage
+path=$2
+
+# Check command
+case "$1" in
+    start)
+        find_path
+        start_svc
+        ;;
+    stop)
+        find_path
+        stop_svc
+        ;;
+    restart)
+        find_path
+        stop_svc
+        start_svc
+        ;;
+    *)
+        usage
+        ;;
+esac
